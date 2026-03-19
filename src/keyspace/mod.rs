@@ -878,6 +878,32 @@ impl Keyspace {
         Ok(())
     }
 
+    /// Collects up to `limit` raw data block payloads from this keyspace's on-disk tables.
+    ///
+    /// Skips L0 since its files have overlapping key ranges and are less representative.
+    ///
+    /// `predicate` receives the first and last user key of each candidate block; return
+    /// `false` to skip a block (it won't count toward `limit`). Use `|_, _| true` to
+    /// include all blocks.
+    ///
+    /// Each returned slice contains the uncompressed block payload bytes — the same bytes
+    /// that are fed into the compression codec when writing. These are suitable as training
+    /// samples for [`lsm_tree::train_zstd_dict`].
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    #[cfg(feature = "zstd")]
+    pub fn sample_data_blocks<F: Fn(&[u8], &[u8]) -> bool>(
+        &self,
+        limit: usize,
+        predicate: F,
+    ) -> crate::Result<Vec<lsm_tree::Slice>> {
+        self.tree
+            .sample_data_blocks(limit, predicate)
+            .map_err(crate::Error::Storage)
+    }
+
     /// Inserts a key-value pair into the keyspace.
     ///
     /// Keys may be up to 65536 bytes long, values up to 2^32 bytes.
