@@ -52,7 +52,7 @@ pub fn serialize_marker_item<W: Write>(
 
     compression.encode_into(writer)?;
 
-    let compressed_value = match compression {
+    let compressed_value: std::borrow::Cow<[u8]> = match compression {
         CompressionType::None => std::borrow::Cow::Borrowed(value),
 
         #[cfg(feature = "lz4")]
@@ -60,6 +60,17 @@ pub fn serialize_marker_item<W: Write>(
             let compressed = lz4_flex::compress(value);
             std::borrow::Cow::Owned(compressed)
         }
+
+        #[cfg(feature = "zstd")]
+        CompressionType::Zstd { level } => {
+            let compressed = zstd::bulk::compress(value, level).map_err(lsm_tree::Error::Io)?;
+            std::borrow::Cow::Owned(compressed)
+        }
+
+        #[cfg(feature = "zstd")]
+        CompressionType::ZstdDict { level, dict } => std::borrow::Cow::Owned(
+            lsm_tree::dict_cache::compress(value, level, &dict).map_err(lsm_tree::Error::Io)?,
+        ),
     };
 
     // NOTE: Truncation is okay and actually needed
@@ -137,7 +148,14 @@ impl Entry {
                 value_type,
                 compression,
             } => {
-                serialize_marker_item(writer, *keyspace_id, key, value, *value_type, *compression)?;
+                serialize_marker_item(
+                    writer,
+                    *keyspace_id,
+                    key,
+                    value,
+                    *value_type,
+                    compression.clone(),
+                )?;
             }
             End(val) => {
                 writer.write_u8(Tag::End.into())?;
@@ -170,6 +188,8 @@ impl Entry {
                     .map_err(|()| lsm_tree::Error::InvalidTag(("ValueType", value_type)))?;
 
                 let compression = CompressionType::decode_from(reader)?;
+                // Clone before moving into the value-decoding match below
+                let compression_for_item = compression.clone();
 
                 // Read keyspace ID
                 let keyspace_id = reader.read_u64::<LittleEndian>()?;
@@ -212,6 +232,36 @@ impl Entry {
 
                         Slice::from(value.freeze())
                     }
+
+                    #[cfg(feature = "zstd")]
+                    CompressionType::Zstd { level } => {
+                        let compressed_value =
+                            Slice::from_reader(reader, on_disk_value_len as usize)?;
+                        let decompressed =
+                            zstd::bulk::decompress(&compressed_value, value_len as usize).map_err(
+                                |e| {
+                                    log::error!("Zstd decompression failed: {e}");
+                                    crate::Error::Decompress(CompressionType::Zstd { level })
+                                },
+                            )?;
+                        decompressed.into()
+                    }
+
+                    #[cfg(feature = "zstd")]
+                    CompressionType::ZstdDict { level, dict } => {
+                        let compressed_value =
+                            Slice::from_reader(reader, on_disk_value_len as usize)?;
+                        lsm_tree::dict_cache::decompress(
+                            &compressed_value,
+                            value_len as usize,
+                            &dict,
+                        )
+                        .map_err(|e| {
+                            log::error!("Zstd dict decompression failed: {e}");
+                            crate::Error::Decompress(CompressionType::ZstdDict { level, dict })
+                        })?
+                        .into()
+                    }
                 };
 
                 Ok(Self::Item {
@@ -219,7 +269,7 @@ impl Entry {
                     key,
                     value,
                     value_type,
-                    compression,
+                    compression: compression_for_item,
                 })
             }
             Tag::End => {
