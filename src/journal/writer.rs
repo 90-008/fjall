@@ -110,7 +110,7 @@ impl Writer {
         let new_path = folder.join(format!("{}.jnl", journal_id + 1));
         log::debug!("Rotating active journal to {}", new_path.display());
 
-        let comp = self.compression;
+        let comp = self.compression.clone();
         let compt = self.compression_threshold;
         *self = Self::create_new(new_path.clone())?;
         self.set_compression(comp, compt);
@@ -279,7 +279,7 @@ impl Writer {
             value,
             value_type,
             if self.compression_threshold > 0 && value.len() >= self.compression_threshold {
-                self.compression
+                self.compression.clone()
             } else {
                 CompressionType::None
             },
@@ -358,7 +358,7 @@ impl Writer {
                 item.value_type,
                 if self.compression_threshold > 0 && item.value.len() >= self.compression_threshold
                 {
-                    self.compression
+                    self.compression.clone()
                 } else {
                     CompressionType::None
                 },
