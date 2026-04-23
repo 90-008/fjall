@@ -4,7 +4,7 @@
 
 pub(crate) mod worker;
 
-pub use lsm_tree::compaction::{Fifo, Leveled, Levelled};
+pub use lsm_tree::compaction::{CompactionStrategy, Fifo, Leveled, Levelled};
 
 /// Compaction filter utilities
 pub mod filter {

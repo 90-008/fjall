@@ -73,3 +73,36 @@ fn keyspace_ingest() -> crate::Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn keyspace_manual_compaction() -> crate::Result<()> {
+    use crate::compaction::Leveled;
+    use std::sync::Arc;
+
+    let folder = tempfile::tempdir()?;
+
+    let db = Database::builder(&folder).worker_threads(0).open()?;
+    let keyspace = db.keyspace("items", KeyspaceCreateOptions::default)?;
+
+    // Use start_ingestion which creates tables directly.
+    {
+        let mut ingest = keyspace.start_ingestion()?;
+        ingest.write("k1", "v1")?;
+        ingest.finish()?;
+    }
+    {
+        let mut ingest = keyspace.start_ingestion()?;
+        ingest.write("k2", "v2")?;
+        ingest.finish()?;
+    }
+
+    assert_eq!(2, keyspace.l0_table_count());
+
+    let strategy = Arc::new(Leveled::default().with_l0_threshold(2));
+    keyspace.compact(strategy)?;
+
+    assert_eq!(0, keyspace.l0_table_count());
+    assert_eq!(2, keyspace.table_count()); // Should have been moved to L6 (Lmax)
+
+    Ok(())
+}

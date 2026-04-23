@@ -396,6 +396,20 @@ impl Keyspace {
         self.tree.disk_space()
     }
 
+    /// Manually triggers compaction on the keyspace.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    pub fn compact(
+        &self,
+        strategy: Arc<dyn crate::compaction::CompactionStrategy>,
+    ) -> crate::Result<()> {
+        let seqno = self.supervisor.snapshot_tracker.get_seqno_safe_to_gc();
+        self.tree.compact(strategy, seqno)?;
+        Ok(())
+    }
+
     /// Returns an iterator that scans through the entire keyspace.
     ///
     /// Avoid using this function, or limit it as otherwise it may scan a lot of items.
