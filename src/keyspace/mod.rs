@@ -267,6 +267,24 @@ impl Keyspace {
         Ok(())
     }
 
+    /// Drops all on-disk tables fully contained in a key range.
+    ///
+    /// This is a physical table-level operation: tables that partially overlap the range are
+    /// left intact. It is intended for append-only keyspaces where occasional over-retention at
+    /// table boundaries is acceptable.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    #[doc(hidden)]
+    pub fn drop_range<K: AsRef<[u8]>, R: RangeBounds<K>>(&self, range: R) -> crate::Result<()> {
+        if self.is_poisoned.is_poisoned() {
+            return Err(crate::Error::Poisoned);
+        }
+
+        Ok(self.tree.drop_range(range)?)
+    }
+
     /// Returns the number of blob bytes on disk that are not referenced.
     ///
     /// These will be reclaimed over time by blob garbage collection automatically.
