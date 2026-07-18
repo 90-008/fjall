@@ -936,6 +936,33 @@ impl Keyspace {
             .map_err(crate::Error::Storage)
     }
 
+    /// Collects up to `limit` raw data block payloads, starting at the first block
+    /// whose key range covers `start_key` (or from the beginning when `start_key`
+    /// is `None`).
+    ///
+    /// Unlike [`Keyspace::sample_data_blocks`], the start position is located via the
+    /// block index instead of scanning every table from its first block, so sampling
+    /// a narrow key range does not require reading every preceding block.
+    ///
+    /// `predicate` receives the first and last user key of each candidate block and
+    /// returns a [`lsm_tree::SampleVerdict`]: included blocks count toward `limit`,
+    /// excluded blocks are skipped, and `Abort` stops the scan immediately.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if an IO error occurs.
+    #[cfg(feature = "zstd")]
+    pub fn sample_data_blocks_from<F: FnMut(&[u8], &[u8]) -> lsm_tree::SampleVerdict>(
+        &self,
+        start_key: Option<&[u8]>,
+        limit: usize,
+        predicate: F,
+    ) -> crate::Result<Vec<lsm_tree::Slice>> {
+        self.tree
+            .sample_data_blocks_from(start_key, limit, predicate)
+            .map_err(crate::Error::Storage)
+    }
+
     /// Inserts a key-value pair into the keyspace.
     ///
     /// Keys may be up to 65536 bytes long, values up to 2^32 bytes.
