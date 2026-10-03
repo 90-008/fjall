@@ -207,7 +207,11 @@ impl Entry {
 
                 let value = match compression {
                     CompressionType::None => {
-                        debug_assert_eq!(value_len, on_disk_value_len);
+                        // a torn write leaves the lengths disagreeing
+                        if value_len != on_disk_value_len {
+                            log::error!("Uncompressed value size does not match its on-disk size");
+                            return Err(crate::Error::Decompress(CompressionType::None));
+                        }
                         Slice::from_reader(reader, on_disk_value_len as usize)?
                     }
 
