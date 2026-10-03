@@ -13,8 +13,8 @@ use crate::{
     meta_keyspace::MetaKeyspace,
     Database, HashMap, Keyspace,
 };
-use lsm_tree::AbstractTree;
-use std::path::PathBuf;
+use lsm_tree::{AbstractTree, SeqNo};
+use std::{collections::hash_map::Entry, path::PathBuf};
 
 /// Recovers keyspaces
 pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::Result<()> {
@@ -116,6 +116,36 @@ pub fn recover_keyspaces(db: &Database, meta_keyspace: &MetaKeyspace) -> crate::
     Ok(())
 }
 
+/// Keyspaces resolved during journal replay, with their persisted seqno
+pub type ReplayKeyspaces = HashMap<InternalKeyspaceId, Option<(Keyspace, Option<SeqNo>)>>;
+
+/// Resolves a journal item's keyspace once per journal, along with its persisted seqno.
+///
+/// Items at or below the persisted seqno are already in the keyspace's tables, so
+/// replaying them into a memtable that gets dropped afterwards is wasted work.
+pub fn resolve_for_replay<'a>(
+    db: &Database,
+    keyspaces: &crate::db::Keyspaces,
+    resolved: &'a mut ReplayKeyspaces,
+    keyspace_id: InternalKeyspaceId,
+) -> crate::Result<Option<&'a (Keyspace, Option<SeqNo>)>> {
+    let entry = match resolved.entry(keyspace_id) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let handle = db
+                .meta_keyspace
+                .resolve_id(keyspace_id)?
+                .and_then(|name| keyspaces.get(&name).cloned())
+                .map(|handle| {
+                    let lsn = handle.tree.get_highest_persisted_seqno();
+                    (handle, lsn)
+                });
+            entry.insert(handle)
+        }
+    };
+    Ok(entry.as_ref())
+}
+
 #[expect(clippy::too_many_lines)]
 pub fn recover_sealed_memtables(
     db: &Database,
@@ -143,6 +173,8 @@ pub fn recover_sealed_memtables(
 
         let mut watermarks: HashMap<_, EvictionWatermark> = HashMap::default();
 
+        let mut resolved = ReplayKeyspaces::default();
+
         for batch in reader {
             let batch = batch?;
 
@@ -151,11 +183,9 @@ pub fn recover_sealed_memtables(
             db.supervisor.seqno.fetch_max(batch.seqno + 1);
 
             for item in batch.items {
-                let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)? else {
-                    continue;
-                };
-
-                let Some(handle) = keyspaces_lock.get(&keyspace_name) else {
+                let Some((handle, keyspace_lsn)) =
+                    resolve_for_replay(db, &keyspaces_lock, &mut resolved, item.keyspace_id)?
+                else {
                     continue;
                 };
 
@@ -170,6 +200,10 @@ pub fn recover_sealed_memtables(
                         keyspace: handle.clone(),
                         lsn: batch.seqno,
                     });
+
+                if keyspace_lsn.is_some_and(|lsn| batch.seqno <= lsn) {
+                    continue;
+                }
 
                 match item.value_type {
                     lsm_tree::ValueType::Value => {
@@ -218,6 +252,9 @@ pub fn recover_sealed_memtables(
                     handle.tree.clear().inspect_err(|e| {
                         log::error!("Keyspace clear failed during recovery: {e}");
                     })?;
+
+                    // The clear dropped the tables, so their persisted seqno no longer applies
+                    resolved.remove(keyspace_id);
                 }
             }
         }

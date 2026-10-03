@@ -683,6 +683,7 @@ impl Database {
                 log::trace!("Recovering active memtables from active journal");
 
                 let reader = db.supervisor.journal.get_reader()?;
+                let mut resolved = crate::recovery::ReplayKeyspaces::default();
 
                 for batch in reader {
                     let batch = batch?;
@@ -692,16 +693,21 @@ impl Database {
                     db.supervisor.seqno.fetch_max(batch.seqno + 1);
 
                     for item in batch.items {
-                        let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)?
+                        let Some((keyspace, keyspace_lsn)) = crate::recovery::resolve_for_replay(
+                            &db,
+                            &keyspaces,
+                            &mut resolved,
+                            item.keyspace_id,
+                        )?
                         else {
                             continue;
                         };
 
-                        let Some(keyspace) = keyspaces.get(&keyspace_name) else {
-                            continue;
-                        };
-
                         let tree = &keyspace.tree;
+
+                        if keyspace_lsn.is_some_and(|lsn| batch.seqno <= lsn) {
+                            continue;
+                        }
 
                         match item.value_type {
                             lsm_tree::ValueType::Value => {
@@ -738,6 +744,9 @@ impl Database {
                             keyspace.tree.clear_active_memtable();
                         } else {
                             keyspace.tree.clear().ok();
+
+                            // The clear dropped the tables, so their persisted seqno no longer applies
+                            resolved.remove(keyspace_id);
                         }
                     }
                 }
