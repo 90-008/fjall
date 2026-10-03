@@ -5,7 +5,7 @@
 use super::entry::Entry;
 use std::{
     fs::{File, OpenOptions},
-    io::{BufReader, Seek},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -19,6 +19,24 @@ pub struct JournalReader {
     pub(crate) path: PathBuf,
     pub(crate) reader: BufReader<File>,
     pub(crate) last_valid_pos: u64,
+
+    /// Bytes consumed so far, tracked here because `stream_position`
+    /// costs an lseek syscall per entry
+    pos: u64,
+}
+
+/// Counts the bytes an entry decode consumes
+struct CountingReader<'a, R> {
+    inner: &'a mut R,
+    read: u64,
+}
+
+impl<R: Read> Read for CountingReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
+    }
 }
 
 impl JournalReader {
@@ -29,6 +47,7 @@ impl JournalReader {
             path: path.as_ref().into(),
             reader: BufReader::new(file),
             last_valid_pos: 0,
+            pos: 0,
         })
     }
 
@@ -40,9 +59,7 @@ impl JournalReader {
     }
 
     fn maybe_truncate_file_to_last_valid_pos(&mut self) -> crate::Result<()> {
-        let stream_pos = self.reader.stream_position()?;
-
-        if stream_pos > self.last_valid_pos {
+        if self.pos > self.last_valid_pos {
             self.truncate_file(self.last_valid_pos)?;
         }
 
@@ -54,9 +71,16 @@ impl Iterator for JournalReader {
     type Item = crate::Result<Entry>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match Entry::decode_from(&mut self.reader) {
+        let mut counted = CountingReader {
+            inner: &mut self.reader,
+            read: 0,
+        };
+        let decoded = Entry::decode_from(&mut counted);
+        self.pos += counted.read;
+
+        match decoded {
             Ok(item) => {
-                self.last_valid_pos = fail_iter!(self.reader.stream_position());
+                self.last_valid_pos = self.pos;
                 Some(Ok(item))
             }
             Err(e) => {
