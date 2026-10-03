@@ -206,9 +206,19 @@ pub fn recover_sealed_memtables(
                         lsn: batch.seqno,
                     });
 
-                handle.tree.clear().inspect_err(|e| {
-                    log::error!("Keyspace clear failed during recovery: {e}");
-                })?;
+                // A clear upgrades the tree's version when it happens, so tables newer than
+                // it were written after it, and only the replayed items before it go
+                if handle
+                    .tree
+                    .get_highest_persisted_seqno()
+                    .is_some_and(|lsn| lsn > batch.seqno)
+                {
+                    handle.tree.clear_active_memtable();
+                } else {
+                    handle.tree.clear().inspect_err(|e| {
+                        log::error!("Keyspace clear failed during recovery: {e}");
+                    })?;
+                }
             }
         }
 

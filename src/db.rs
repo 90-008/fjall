@@ -728,7 +728,17 @@ impl Database {
                             continue;
                         };
 
-                        keyspace.tree.clear().ok();
+                        // A clear upgrades the tree's version when it happens, so tables newer
+                        // than it were written after it, and only the replayed items before it go
+                        if keyspace
+                            .tree
+                            .get_highest_persisted_seqno()
+                            .is_some_and(|lsn| lsn > batch.seqno)
+                        {
+                            keyspace.tree.clear_active_memtable();
+                        } else {
+                            keyspace.tree.clear().ok();
+                        }
                     }
                 }
 
