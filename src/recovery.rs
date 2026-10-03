@@ -146,6 +146,10 @@ pub fn recover_sealed_memtables(
         for batch in reader {
             let batch = batch?;
 
+            // Not every batch leaves an item behind (a clear doesn't), so the counter
+            // has to move past the batch itself, not just the items it recovers
+            db.supervisor.seqno.fetch_max(batch.seqno + 1);
+
             for item in batch.items {
                 let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)? else {
                     continue;

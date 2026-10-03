@@ -687,6 +687,10 @@ impl Database {
                 for batch in reader {
                     let batch = batch?;
 
+                    // Not every batch leaves an item behind (a clear doesn't), so the
+                    // counter has to move past the batch itself
+                    db.supervisor.seqno.fetch_max(batch.seqno + 1);
+
                     for item in batch.items {
                         let Some(keyspace_name) = db.meta_keyspace.resolve_id(item.keyspace_id)?
                         else {
@@ -739,18 +743,20 @@ impl Database {
 
                     // IMPORTANT: Add active memtable size to current write buffer size
                     db.supervisor.write_buffer_size.allocate(size);
-
-                    // Recover seqno
-                    let maybe_next_seqno = keyspace
-                        .tree
-                        .get_highest_seqno()
-                        .map(|x| x + 1)
-                        .unwrap_or_default();
-
-                    db.supervisor.seqno.fetch_max(maybe_next_seqno);
-                    log::debug!("Database seqno is now {}", db.supervisor.seqno.get());
                 }
             }
+
+            // Recover seqno, also when there was no journal to replay
+            for keyspace in keyspaces.values() {
+                let maybe_next_seqno = keyspace
+                    .tree
+                    .get_highest_seqno()
+                    .map(|x| x + 1)
+                    .unwrap_or_default();
+
+                db.supervisor.seqno.fetch_max(maybe_next_seqno);
+            }
+            log::debug!("Database seqno is now {}", db.supervisor.seqno.get());
         }
 
         db.supervisor
