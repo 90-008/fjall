@@ -26,7 +26,10 @@ use options::CreateOptions;
 use std::{
     ops::RangeBounds,
     path::Path,
-    sync::{atomic::AtomicBool, Arc, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        Arc, MutexGuard,
+    },
     time::Duration,
 };
 use write_delay::perform_write_stall;
@@ -87,6 +90,14 @@ pub struct KeyspaceInner {
     pub(crate) stats: Arc<Stats>,
 
     pub(crate) worker_messager: flume::Sender<WorkerMessage>,
+
+    pub(crate) compaction_messager: flume::Sender<WorkerMessage>,
+
+    /// spare flushes and rotations queued for the compaction workers
+    pub(crate) spare_messages: Arc<AtomicUsize>,
+
+    /// compaction runs queued but not picked up by a worker yet
+    pub(crate) pending_compactions: AtomicUsize,
 
     #[expect(unused)]
     lock_file: LockedFileGuard,
@@ -335,6 +346,9 @@ impl Keyspace {
             config,
             supervisor: db.supervisor.clone(),
             worker_messager: db.worker_pool.sender.clone(),
+            compaction_messager: db.worker_pool.compaction_sender.clone(),
+            spare_messages: db.worker_pool.spare_messages.clone(),
+            pending_compactions: AtomicUsize::default(),
             is_deleted: AtomicBool::default(),
             is_poisoned: db.is_poisoned.clone(),
             lock_file: db.lock_file.clone(),
@@ -373,6 +387,9 @@ impl Keyspace {
         Ok(Self(Arc::new(KeyspaceInner {
             supervisor: db.supervisor.clone(),
             worker_messager: db.worker_pool.sender.clone(),
+            compaction_messager: db.worker_pool.compaction_sender.clone(),
+            spare_messages: db.worker_pool.spare_messages.clone(),
+            pending_compactions: AtomicUsize::default(),
             id: keyspace_id,
             name,
             config,
@@ -782,11 +799,7 @@ impl Keyspace {
 
         drop(journal_writer);
 
-        self.supervisor.flush_manager.enqueue(Arc::new(FlushTask {
-            keyspace: self.clone(),
-        }));
-
-        self.worker_messager.send(WorkerMessage::Flush).ok();
+        self.enqueue_flush();
 
         {
             // NOTE: If the difference between watermark is too large, and
@@ -859,12 +872,76 @@ impl Keyspace {
         let latest_version = lock.latest_version();
         let active_memtable = &latest_version.active_memtable;
 
-        self.worker_messager
-            .try_send(WorkerMessage::RotateMemtable(
-                self.clone(),
-                active_memtable.id(),
-            ))
-            .ok();
+        let rotate = || WorkerMessage::RotateMemtable(self.clone(), active_memtable.id());
+
+        self.worker_messager.try_send(rotate()).ok();
+
+        // a rotation of a memtable that's gone already does nothing, so a
+        // second copy is harmless, and a writer asks again on its next write
+        // if both got dropped
+        if !self.compaction_messager.same_channel(&self.worker_messager) {
+            self.send_spare(rotate(), false);
+        }
+    }
+
+    pub(crate) fn enqueue_flush(&self) {
+        self.supervisor.flush_manager.enqueue(Arc::new(FlushTask {
+            keyspace: self.clone(),
+        }));
+
+        if self.compaction_messager.same_channel(&self.worker_messager) {
+            self.worker_messager.send(WorkerMessage::Flush).ok();
+            return;
+        }
+
+        // worker 0 gets here itself when it rotates a memtable, and nobody
+        // else reads its channel, so it can't wait for room there. if it's
+        // full the spare has to go out, or the task could sit until the next
+        // flush. a flush that finds no task does nothing
+        let reached_worker_0 = self.worker_messager.try_send(WorkerMessage::Flush).is_ok();
+        self.send_spare(WorkerMessage::Flush, !reached_worker_0);
+    }
+
+    // a spare is a copy of worker 0's work on the compaction queue, so an
+    // idle compaction worker can take it. more spares queued than there are
+    // compaction workers add nothing, so they're capped at that unless forced
+    fn send_spare(&self, message: WorkerMessage, force: bool) {
+        let max_spares = self.supervisor.db_config.worker_threads - 1;
+
+        if self
+            .spare_messages
+            .fetch_update(SeqCst, SeqCst, |n| {
+                (force || n < max_spares).then_some(n + 1)
+            })
+            .is_ok()
+        {
+            self.compaction_messager.send(message).ok();
+        }
+    }
+
+    // a run makes one compaction choice, so a backlog needs several runs and
+    // they can go in parallel, one per worker. more would only be duplicates.
+    // a request that finds them all queued loses nothing, because each of
+    // them starts after it
+    pub(crate) fn request_compaction(&self) {
+        let max_pending = self.supervisor.db_config.worker_threads.max(1);
+
+        while self
+            .pending_compactions
+            .fetch_update(SeqCst, SeqCst, |n| (n < max_pending).then_some(n + 1))
+            .is_ok()
+        {
+            // with fewer than two workers this is the bounded channel they
+            // share, and a full one drops the run like any other message
+            if self
+                .compaction_messager
+                .try_send(WorkerMessage::Compact(self.clone()))
+                .is_err()
+            {
+                self.pending_compactions.fetch_sub(1, SeqCst);
+                break;
+            }
+        }
     }
 
     pub(crate) fn check_memtable_rotate(&self, size: u64) {

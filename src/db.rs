@@ -19,7 +19,7 @@ use crate::{
     supervisor::{Supervisor, SupervisorInner},
     tx::single_writer::Openable,
     version::FormatVersion,
-    worker_pool::{WorkerMessage, WorkerPool},
+    worker_pool::WorkerPool,
     write_buffer_manager::WriteBufferManager,
     HashMap, Keyspace, KeyspaceCreateOptions,
 };
@@ -66,19 +66,11 @@ impl Drop for DatabaseInner {
 
         self.stop_signal.send();
 
-        let _ = self.worker_pool.rx.drain().count();
-
-        while self
-            .active_thread_counter
-            .load(std::sync::atomic::Ordering::Relaxed)
-            > 0
-        {
-            let _ = self.worker_pool.sender.send(WorkerMessage::Close);
-            std::thread::sleep(std::time::Duration::from_micros(10));
-        }
+        self.worker_pool.clear();
+        self.worker_pool.close(&self.active_thread_counter);
 
         // Drain again after threads are closed
-        let _ = self.worker_pool.rx.drain().count();
+        self.worker_pool.clear();
 
         // IMPORTANT: Break cyclic Arcs
         self.supervisor.flush_manager.clear();
@@ -639,7 +631,7 @@ impl Database {
         // Construct (empty) database, then fill back with keyspace data
         let inner = DatabaseInner {
             supervisor,
-            worker_pool: WorkerPool::prepare(),
+            worker_pool: WorkerPool::prepare(config.worker_threads),
             keyspace_id_counter: SequenceNumberCounter::new(1),
             meta_keyspace: meta_keyspace.clone(),
             config,
@@ -798,28 +790,18 @@ impl Database {
                 );
 
                 // IMPORTANT: Add task to flush manager, so it can be flushed
-                db.supervisor
-                    .flush_manager
-                    .enqueue(Arc::new(crate::flush::Task {
-                        keyspace: keyspace.clone(),
-                    }));
-
-                keyspace.worker_messager.send(WorkerMessage::Flush).ok();
+                keyspace.enqueue_flush();
             } else if keyspace.tree.l0_run_count() > 0 {
                 log::debug!(
                     "Queuing keyspace {:?} to maybe get compacted because L0 runs > 0",
                     keyspace.name(),
                 );
 
-                keyspace
-                    .worker_messager
-                    .send(WorkerMessage::Compact(keyspace.clone()))
-                    .ok();
+                keyspace.request_compaction();
             }
         }
 
         db.worker_pool.start(
-            db.config.worker_threads,
             &db.supervisor,
             &db.stats,
             &PoisonDart::new(db.is_poisoned.clone()),
@@ -912,7 +894,7 @@ impl Database {
 
         let inner = DatabaseInner {
             supervisor,
-            worker_pool: WorkerPool::prepare(),
+            worker_pool: WorkerPool::prepare(config.worker_threads),
             keyspace_id_counter: SequenceNumberCounter::new(1),
             meta_keyspace,
             config,
@@ -926,7 +908,6 @@ impl Database {
         let db = Self(Arc::new(inner));
 
         db.worker_pool.start(
-            db.config.worker_threads,
             &db.supervisor,
             &db.stats,
             &PoisonDart::new(db.is_poisoned.clone()),

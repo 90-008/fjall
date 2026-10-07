@@ -10,10 +10,14 @@ use lsm_tree::MemtableId;
 use std::{
     borrow::Cow,
     sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
+        atomic::{
+            AtomicUsize,
+            Ordering::{Relaxed, SeqCst},
+        },
         Arc, Mutex,
     },
     thread::JoinHandle,
+    time::Duration,
 };
 
 pub enum WorkerMessage {
@@ -43,29 +47,57 @@ type WorkerHandle = JoinHandle<Result<(), crate::Error>>;
 
 pub struct WorkerPool {
     thread_handles: Mutex<Vec<WorkerHandle>>,
+    pool_size: usize,
     pub(crate) rx: flume::Receiver<WorkerMessage>,
     pub(crate) sender: flume::Sender<WorkerMessage>,
+
+    // what workers 1.. read. worker 0 never does, so it stays free for
+    // flushes and memtable rotations. with a single worker this is just the
+    // channel above
+    pub(crate) compaction_rx: flume::Receiver<WorkerMessage>,
+    pub(crate) compaction_sender: flume::Sender<WorkerMessage>,
+
+    /// see `Keyspace::send_spare`
+    pub(crate) spare_messages: Arc<AtomicUsize>,
+
+    #[cfg(test)]
+    ticks: Arc<AtomicUsize>,
 }
 
 impl WorkerPool {
-    pub fn prepare() -> Self {
+    pub fn prepare(pool_size: usize) -> Self {
         let (sender, rx) = flume::bounded(1_000);
+
+        // unbounded so a close or a flush never waits on it, and
+        // `Keyspace::request_compaction` caps the compactions in it
+        let (compaction_sender, compaction_rx) = if pool_size > 1 {
+            flume::unbounded()
+        } else {
+            (sender.clone(), rx.clone())
+        };
 
         Self {
             thread_handles: Mutex::default(),
+            pool_size,
             rx,
             sender,
+            compaction_rx,
+            compaction_sender,
+            spare_messages: Arc::default(),
+            #[cfg(test)]
+            ticks: Arc::default(),
         }
     }
 
     pub fn start(
         &self,
-        pool_size: usize,
         supervisor: &Supervisor,
         stats: &Arc<Stats>,
         poison_dart: &PoisonDart,
         thread_counter: &Arc<AtomicUsize>,
     ) -> crate::Result<()> {
+        let pool_size = self.pool_size;
+
         log::debug!("Starting worker pool with {pool_size} threads");
 
         let thread_handles = claim_and_spawn(pool_size, thread_counter, |i| {
@@ -74,13 +106,20 @@ impl WorkerPool {
                 .spawn({
                     log::trace!("Starting fjall worker thread #{i}");
 
+                    let rx = if i == 0 {
+                        self.rx.clone()
+                    } else {
+                        self.compaction_rx.clone()
+                    };
+
                     let worker_state = WorkerState {
-                        pool_size,
                         worker_id: i,
-                        rx: self.rx.clone(),
+                        rx,
                         supervisor: supervisor.clone(),
                         stats: stats.clone(),
-                        sender: self.sender.clone(),
+                        spare_messages: self.spare_messages.clone(),
+                        #[cfg(test)]
+                        ticks: self.ticks.clone(),
                     };
 
                     let thread_counter = thread_counter.clone();
@@ -116,6 +155,34 @@ impl WorkerPool {
         *self.thread_handles.lock().expect("lock is poisoned") = thread_handles;
 
         Ok(())
+    }
+
+    pub(crate) fn close(&self, thread_counter: &AtomicUsize) {
+        // workers 1.. leave on the first close they read, and their channel
+        // is unbounded, so this can't block
+        for _ in 1..self.pool_size {
+            self.compaction_sender.send(WorkerMessage::Close).ok();
+        }
+
+        // only worker 0 reads this one. don't wait on a full channel for
+        // good, worker 0 may have crashed and then nobody makes room
+        let mut close_sent = false;
+
+        while thread_counter.load(Relaxed) > 0 {
+            if !close_sent {
+                close_sent = self
+                    .sender
+                    .send_timeout(WorkerMessage::Close, Duration::from_millis(1))
+                    .is_ok();
+            }
+
+            std::thread::sleep(Duration::from_micros(10));
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        let _ = self.rx.drain().count();
+        let _ = self.compaction_rx.drain().count();
     }
 }
 
@@ -158,12 +225,13 @@ impl Drop for ActiveThreadGuard {
 }
 
 struct WorkerState {
-    pool_size: usize,
     worker_id: usize,
     supervisor: Supervisor,
     rx: flume::Receiver<WorkerMessage>,
-    sender: flume::Sender<WorkerMessage>,
     stats: Arc<Stats>,
+    spare_messages: Arc<AtomicUsize>,
+    #[cfg(test)]
+    ticks: Arc<AtomicUsize>,
 }
 
 fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
@@ -171,7 +239,20 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
         return Ok(true);
     };
 
+    #[cfg(test)]
+    ctx.ticks.fetch_add(1, Relaxed);
+
     log::trace!("Worker #{} got message: {item:?}", ctx.worker_id);
+
+    // flushes and rotations only reach the other workers as spares
+    if ctx.worker_id > 0
+        && matches!(
+            item,
+            WorkerMessage::Flush | WorkerMessage::RotateMemtable(..)
+        )
+    {
+        ctx.spare_messages.fetch_sub(1, SeqCst);
+    }
 
     match item {
         WorkerMessage::Close => {
@@ -235,11 +316,7 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
                 &ctx.stats,
             )?;
 
-            for _ in 0..ctx.pool_size {
-                ctx.sender
-                    .try_send(WorkerMessage::Compact(task.keyspace.clone()))
-                    .ok();
-            }
+            task.keyspace.request_compaction();
 
             ctx.supervisor
                 .journal_manager
@@ -248,13 +325,7 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
                 .maintenance()?;
         }
         WorkerMessage::Compact(keyspace) => {
-            // NOTE: Let one worker prioritize flushing if there are pending flushes
-            //
-            // Disable when only 1 worker exists to avoid deadlock
-            if ctx.pool_size > 1 && ctx.worker_id == 0 {
-                ctx.sender.send(WorkerMessage::Compact(keyspace)).ok();
-                return Ok(false);
-            }
+            keyspace.pending_compactions.fetch_sub(1, SeqCst);
 
             run_compaction(&keyspace, &ctx.supervisor.snapshot_tracker, &ctx.stats)?;
         }
@@ -266,8 +337,206 @@ fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AbstractTree, Database, KeyspaceCreateOptions};
+    use crate::{
+        compaction::filter::{CompactionFilter, Context, Factory, ItemAccessor, Verdict},
+        AbstractTree, Database, KeyspaceCreateOptions,
+    };
+    use std::{
+        sync::{atomic::AtomicBool, Condvar},
+        thread::sleep,
+        time::{Duration, Instant},
+    };
     use test_log::test;
+
+    // stands in for a long compaction: a merge stops at its first item until
+    // the test opens the gate. make_filter would be too early, it runs under
+    // the version lock that a flush needs
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        opened: Condvar,
+        entered: AtomicUsize,
+    }
+
+    impl Gate {
+        fn open(&self) {
+            *self.open.lock().expect("lock is poisoned") = true;
+            self.opened.notify_all();
+        }
+
+        fn pass(&self) {
+            self.entered.fetch_add(1, SeqCst);
+
+            let open = self.open.lock().expect("lock is poisoned");
+            drop(
+                self.opened
+                    .wait_while(open, |open| !*open)
+                    .expect("lock is poisoned"),
+            );
+        }
+    }
+
+    // opens the gate when a test ends, by panic too, because closing the
+    // database waits for the stuck compaction
+    struct OpenOnDrop<'a>(&'a Gate);
+
+    impl Drop for OpenOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    struct GateFilter(Arc<Gate>);
+
+    impl Factory for GateFilter {
+        fn name(&self) -> &'static str {
+            "gate"
+        }
+
+        fn make_filter(&self, _: &Context) -> Box<dyn CompactionFilter> {
+            Box::new(Self(self.0.clone()))
+        }
+    }
+
+    impl CompactionFilter for GateFilter {
+        fn filter_item(&mut self, _: ItemAccessor<'_>, _: &Context) -> lsm_tree::Result<Verdict> {
+            self.0.pass();
+            Ok(Verdict::Keep)
+        }
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            sleep(Duration::from_millis(1));
+        }
+    }
+
+    // two workers, with worker 1 stuck in a compaction behind the gate
+    fn open_with_busy_compaction_worker(
+        folder: &tempfile::TempDir,
+        gate: &Arc<Gate>,
+    ) -> crate::Result<(Database, Keyspace)> {
+        let factory: Arc<dyn Factory> = Arc::new(GateFilter(gate.clone()));
+
+        let db = Database::builder(folder)
+            .worker_threads(2)
+            .with_compaction_filter_factories(Arc::new(move |_| Some(factory.clone())))
+            .open()?;
+
+        let ks = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+        // overlapping tables pile up in l0 until the leveled strategy merges them
+        for _ in 0..6 {
+            ks.insert("a", "a")?;
+            ks.rotate_memtable_and_wait()?;
+        }
+
+        wait_until("a compaction to reach the gate", || {
+            gate.entered.load(SeqCst) > 0
+        });
+
+        Ok((db, ks))
+    }
+
+    #[test]
+    fn flush_worker_idles_while_compactions_wait() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let gate = Arc::new(Gate::default());
+        let (db, ks) = open_with_busy_compaction_worker(&folder, &gate)?;
+        let _open = OpenOnDrop(&gate);
+
+        // the flush can't wait on worker 1, and it asks for more compactions
+        // that have nobody to run them
+        ks.insert("b", "b")?;
+        ks.rotate_memtable_and_wait()?;
+
+        let ticks_before = db.worker_pool.ticks.load(SeqCst);
+        sleep(Duration::from_millis(200));
+        let ticks = db.worker_pool.ticks.load(SeqCst) - ticks_before;
+
+        assert!(
+            ticks <= 2,
+            "workers handled {ticks} messages while they should all wait",
+        );
+
+        // the stuck run and at least one queued one, so nothing got lost
+        let completed = db.stats.compactions_completed.load(SeqCst);
+        gate.open();
+        wait_until("the queued compactions to run", || {
+            db.stats.compactions_completed.load(SeqCst) >= completed + 2
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn spare_messages_are_capped_while_compaction_workers_are_busy() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let gate = Arc::new(Gate::default());
+        let (db, ks) = open_with_busy_compaction_worker(&folder, &gate)?;
+        let _open = OpenOnDrop(&gate);
+
+        for _ in 0..100 {
+            ks.request_rotation();
+        }
+
+        // two compaction runs of the keyspace and one spare for worker 1
+        assert!(db.worker_pool.compaction_rx.len() <= 3);
+        assert!(db.worker_pool.spare_messages.load(SeqCst) <= 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_requests_are_capped_per_keyspace() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let db = Database::builder(&folder)
+            .worker_threads_unchecked(0)
+            .open()?;
+        let ks = db.keyspace("default", KeyspaceCreateOptions::default)?;
+
+        for _ in 0..10 {
+            ks.request_compaction();
+        }
+
+        assert_eq!(1, db.worker_pool.compaction_rx.len());
+
+        Ok(())
+    }
+
+    #[test]
+    fn drop_closes_busy_workers_behind_a_full_queue() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let gate = Arc::new(Gate::default());
+        let (db, ks) = open_with_busy_compaction_worker(&folder, &gate)?;
+        let _open = OpenOnDrop(&gate);
+
+        // keeps the bounded queue full the whole time the database closes
+        let stop_filling = Arc::new(AtomicBool::new(false));
+        let filler = std::thread::spawn({
+            let sender = db.worker_pool.sender.clone();
+            let stop_filling = stop_filling.clone();
+            move || {
+                while !stop_filling.load(SeqCst) {
+                    sender.try_send(WorkerMessage::Flush).ok();
+                }
+            }
+        });
+        wait_until("the queue to fill", || db.worker_pool.sender.is_full());
+
+        let closing = std::thread::spawn(move || drop((ks, db)));
+        sleep(Duration::from_millis(50));
+        gate.open();
+        wait_until("the database to close", || closing.is_finished());
+
+        stop_filling.store(true, SeqCst);
+        filler.join().expect("filler should not panic");
+
+        Ok(())
+    }
 
     // https://github.com/fjall-rs/fjall/pull/303
     #[test]
